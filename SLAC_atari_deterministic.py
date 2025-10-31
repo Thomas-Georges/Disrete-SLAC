@@ -51,6 +51,12 @@ os.chdir(script_dir)
 
 @dataclass
 class Args:
+
+    # Atari/game generalization controls
+    use_action_subset: bool = False
+    """if true, wrap env to expose a smaller Discrete action set (per-game preset)"""
+    pong_rally_done: bool = True
+    """end episode after each rally (Pong only); ignored for other games"""
     exp_name: str = os.path.basename(__file__)[: -len(".py")]
     """the name of this experiment"""
     seed: int = 1
@@ -64,23 +70,34 @@ class Args:
     """if toggled, this experiment will be tracked with Weights and Biases"""
     save_model: bool = True
     """if toggled, the trained model will be saved to disk"""
-    from_scratch: bool = False
+    #from_scratch: bool = False
+    from_scratch: bool = True
+
     """if toggled, the model will be trained from scratch"""
     ckpt_path = "checkpoints//ALE//Pong-v5__SLAC_PONG_deterministic__1__941_full_pretrain_checkpoint//model_pretrained_kl_teacher.pth"
     """If not from scratch, path to the pretrained model"""
     wandb_project_name: str = "SLAC_PONG"
     """the wandb's project name"""
+    wandb_group: str = "Batch_SLAC"
+
     wandb_entity: str = ""
     """the entity (team) of wandb's project"""
     capture_video: bool = False
     """whether to capture videos of the agent performances (check out `videos` folder)"""
 
     # Algorithm specific arguments
+    #env_id: str = "ALE/Pong-v5"
     env_id: str = "ALE/Pong-v5"
+
     """the id of the environment"""
     num_envs: int = 1
     """the number of parallel game environments"""
-    total_timesteps: int = 10_000_000
+    #total_timesteps: int = 10_000_000
+    #total_timesteps: int = 100000
+    total_timesteps: int = 15000
+    #total_timesteps: int = 11000
+
+
     """total timesteps of the experiments"""
     q_learning_rate: float = 3e-4
     """the learning rate of the q_network optimizer"""
@@ -97,16 +114,20 @@ class Args:
     gamma: float = 0.99
     """the discount factor"""
     learning_starts: int = 10000
+    #learning_starts: int = 100
     """timestep to start learning"""
     train_frequency: int = 4
     """the frequency of training"""
     target_network_frequency: int = 10000
+    #target_network_frequency: int = 100
+
     """the frequency of target network update"""
     tau: float = 0.005
     """the polyak averaging factor for target network update"""
     sequence_len : int = 8
     """the length of the sequence for training"""
-    buffer_size: int = 100_000
+    #buffer_size: int = 100_000
+    buffer_size: int = 500_00
     """the replay memory buffer size"""
     kl_analytic: bool = True
     """if toggled, the KL divergence will be computed analytically"""
@@ -121,6 +142,22 @@ class Args:
     hidden_dims: tuple = (256, 256)
     """the hidden dimensions of the Q-network"""
 
+class ActionSubset(gym.ActionWrapper):
+    """
+    Expose a smaller Discrete(K) by remapping local indices to the underlying ALE action indices.
+    Use only when you intentionally want a reduced action set; otherwise keep the env's minimal set.
+    """
+    def __init__(self, env, allowed):
+        super().__init__(env)
+        self._map = np.array(allowed, dtype=np.int64)
+        assert len(self._map) > 0, "allowed must be non-empty"
+        self.action_space = gym.spaces.Discrete(len(self._map))
+
+    def action(self, a):
+        # map agent's 0..K-1 action to ALE index
+        return int(self._map[int(a)])
+
+
 
 def make_env(env_id, seed, idx, capture_video=False, run_name=""):
     def thunk():
@@ -131,18 +168,44 @@ def make_env(env_id, seed, idx, capture_video=False, run_name=""):
             env = gym.make(env_id, frameskip=1, full_action_space=False)
         env = gym.wrappers.RecordEpisodeStatistics(env)
 
+        # env = NoopResetEnv(env, noop_max=30)
+        # env = MaxAndSkipEnv(env, skip=4)
+        # env = EpisodicLifeEnv(env)
+        # env = RallyDoneWrapper(env)
+        # if "FIRE" in env.unwrapped.get_action_meanings():
+        #     env = FireResetEnv(env)
+        # env = ClipRewardEnv(env)
+        # env = gym.wrappers.ResizeObservation(env, (64, 64))
+        # env = gym.wrappers.GrayscaleObservation(env)
+        # env.action_space.seed(seed)
+
+
+        # Standard SB3-style Atari preprocessing
         env = NoopResetEnv(env, noop_max=30)
         env = MaxAndSkipEnv(env, skip=4)
         env = EpisodicLifeEnv(env)
-        env = RallyDoneWrapper(env)
+
+        # Pong-only: optionally end episode after each rally (reward != 0)
+        if "Pong" in env.spec.id and args.pong_rally_done:
+            env = RallyDoneWrapper(env)
+
+        # Auto fire-start games (Breakout/SpaceInvaders/etc.)
         if "FIRE" in env.unwrapped.get_action_meanings():
             env = FireResetEnv(env)
+
+        # Optional, per-game reduced action subset (default OFF)
+        if args.use_action_subset:
+            if "Pong" in env.spec.id:
+                # NOOP, UP, DOWN (standard 3-action subset in literature)
+                env = ActionSubset(env, allowed=[0, 2, 3])
+            # else: keep the game's minimal action set (no reduction)
+
+        # Observation & reward transforms
         env = ClipRewardEnv(env)
         env = gym.wrappers.ResizeObservation(env, (64, 64))
-        env = gym.wrappers.GrayScaleObservation(env)
-
-
+        env = gym.wrappers.GrayscaleObservation(env)
         env.action_space.seed(seed)
+
         return env
 
     return thunk
@@ -688,14 +751,16 @@ def compute_loss(model, images, actions, step_types, step=None, rewards=None, di
 if __name__ == '__main__':
     args = tyro.cli(Args)
     run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
+    print("ENV_ID!!!", args.env_id)
 
     if args.track:
         import wandb
         wandb.login()
         run = wandb.init(
             project=args.wandb_project_name,
-            entity=None,
+            entity=(args.wandb_entity or None),
             sync_tensorboard=True,
+            group=(args.wandb_group or None),
             config=vars(args),
             name=run_name,
             monitor_gym=True,
@@ -726,9 +791,11 @@ if __name__ == '__main__':
               args.capture_video, run_name) for i in range(args.num_envs)])
     assert isinstance(envs.single_action_space, gym.spaces.Discrete), "only discrete action space is supported"
 
-    ACTION_MAPPING = {0: 0, 1: 2, 2: 3}
-    n_actions = len(ACTION_MAPPING.keys())
-    action_space = Discrete(n_actions)
+    # ACTION_MAPPING = {0: 0, 1: 2, 2: 3}
+    # n_actions = len(ACTION_MAPPING.keys())
+    # action_space = Discrete(n_actions)
+    action_space = envs.single_action_space
+
     #action_dim = int(np.prod(action_space.shape))
 
     """obs,_ = envs.reset()
@@ -795,7 +862,9 @@ if __name__ == '__main__':
         print("Collecting bootstrap data for model pretraining...")
         while rb.ptr < 10_000:                 # or 10 episodes for DM-Control
             actions = np.array([action_space.sample() for _ in range(envs.num_envs)])
-            real_actions = np.array([ACTION_MAPPING[a.item()] for a in actions])
+            #real_actions = np.array([ACTION_MAPPING[a.item()] for a in actions])
+            real_actions = actions
+
             #with tic("env.step"):
             next_obs, rewards, terminations, truncations, infos = envs.step(real_actions)
             done = terminations | truncations 
@@ -815,7 +884,9 @@ if __name__ == '__main__':
             
         # 1. model-only optimisation loop -----------------------------------------
         print("Pretraining the model...")
-        for pretrain_step in tqdm(range(100_000)):
+        #for pretrain_step in tqdm(range(100_000)):
+        for pretrain_step in tqdm(range(1000)):
+        #for pretrain_step in tqdm(range(250)):
             batch = rb.sample(args.batch_size)
             images  = (batch["obs"].float() / 255.)
                 #print(images.dtype, images.min().item(), images.max().item())
@@ -831,7 +902,9 @@ if __name__ == '__main__':
             Model.optimizer.step()
 
             if args.track:
-                if (pretrain_step) % 10_000 == 0:
+                #if (pretrain_step) % 10_000 == 0:
+                if (pretrain_step) % 100 == 0:
+
                     sequence = rb.sample(1)
                     #image = sequence["obs"][0][0].unsqueeze(0)  # Get the first image in the sequence
                     #rollout_images = Model.model_rollout(image, H=args.sequence_len-1)  # Generate a sequence of images
@@ -896,7 +969,7 @@ if __name__ == '__main__':
 
 
 
-    for global_step in range(args.total_timesteps):
+    for global_step in tqdm(range(args.total_timesteps)):
         agent.epsilon = agent.linear_schedule(args.start_e, args.end_e, int(args.exploration_fraction * args.total_timesteps), global_step)
 
      # -------- Bayes filter: PREDICT (use PRIORS) --------
@@ -930,7 +1003,9 @@ if __name__ == '__main__':
             # map to env actions
         
         a_np  = actions.detach().cpu().numpy()
-        real_actions = np.array([ACTION_MAPPING[int(a)] for a in a_np], dtype=np.int64)
+        #real_actions = np.array([ACTION_MAPPING[int(a)] for a in a_np], dtype=np.int64)
+        real_actions = a_np.astype(np.int64)
+
 
         #execute the game and log data.
         next_obs, rewards, terminations, truncations, infos = envs.step(real_actions)
@@ -1087,8 +1162,12 @@ if __name__ == '__main__':
                 log_rollout_grid(preds_imgs.squeeze(0).detach().cpu(), step=0, caption="Predicted Images")
 
             
-            if global_step % 1_000_000 == 0 and global_step > 0:
+            if global_step % 100 == 0 and global_step > 0:
+                #print("GLOBAL STEP!!!!!", global_step)
+            #if global_step % 1_000_000 == 0 and global_step > 0:
+
                 if args.save_model:
+                    #print("SAVE MODEL!!!!!!!!!!")
                     save_dir   = f"runs/{run_name}"
                     os.makedirs(save_dir, exist_ok=True)
                     model_path = f"{save_dir}/{args.exp_name}.pt"
@@ -1118,10 +1197,14 @@ if __name__ == '__main__':
 
                     # Upload the model to wandb
                     if args.track:
-                        artifact = wandb.Artifact(f"model-{int(global_step/1_000_000)}M", type="model")
+                        #artifact = wandb.Artifact(f"model-{int(global_step/1_000_000)}M", type="model")
+                        artifact = wandb.Artifact(f"model-{int(global_step/100)}M", type="model")
+
                         artifact.add_file(model_path)
                         run.log_artifact(artifact)
-                        print(f"Model uploaded to wandb as artifact: model-{int(global_step/1_000_000)}M")
+                        #print(f"Model uploaded to wandb as artifact: model-{int(global_step/1_000_000)}M")
+                        print(f"Model uploaded to wandb as artifact: model-{int(global_step/100)}M")
+
     
     envs.close()
     writer.close()
